@@ -26,8 +26,8 @@ word_scheduler = None
 bio_scheduler = None
 is_running = True
 reconnect_attempt = 0
-MAX_RECONNECT_ATTEMPTS = 100  # Максимальное количество попыток переподключения
-BASE_RECONNECT_DELAY = 5  # Базовая задержка в секундах
+MAX_RECONNECT_ATTEMPTS = 100
+BASE_RECONNECT_DELAY = 5
 
 TEMP_DIR = "temp_audio"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -96,10 +96,9 @@ def get_users_navigation_keyboard(page, total_pages, prefix):
     return InlineKeyboardMarkup(keyboard)
 
 
-# ===== БЕЗОПАСНАЯ ОТПРАВКА С ПОВТОРНЫМИ ПОПЫТКАМИ =====
+# ===== БЕЗОПАСНАЯ ОТПРАВКА =====
 
 async def safe_send_message(bot, chat_id, text, parse_mode='HTML', reply_markup=None, max_retries=5):
-    """Безопасная отправка сообщения с повторными попытками и задержкой"""
     for attempt in range(max_retries):
         try:
             return await bot.send_message(
@@ -124,7 +123,6 @@ async def safe_send_message(bot, chat_id, text, parse_mode='HTML', reply_markup=
 
 
 async def safe_edit_message(message, text, parse_mode='HTML', reply_markup=None, max_retries=3):
-    """Безопасное редактирование сообщения с повторными попытками"""
     for attempt in range(max_retries):
         try:
             return await message.edit_text(
@@ -154,7 +152,7 @@ def get_word_audio(word):
         return None
 
 
-# ===== БАЗА ДАННЫХ =====
+# ===== БАЗА ДАННЫХ (ИСПРАВЛЕНО) =====
 
 def init_db():
     connection = sqlite3.connect('english_words.db')
@@ -227,15 +225,32 @@ def init_db():
             pass
     connection.commit()
 
+    # ИСПРАВЛЕНИЕ: Чиним битые записи в базе
+    try:
+        cursor.execute("UPDATE words SET translation = 'перевод' WHERE translation IS NULL OR translation = ''")
+        cursor.execute("UPDATE words SET word = 'unknown' WHERE word IS NULL OR word = ''")
+        connection.commit()
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute('SELECT COUNT(*) FROM words')
     count = cursor.fetchone()[0]
 
     if count < len(WORDS_DATABASE):
         print(f"📚 Загрузка слов... (текущее: {count})")
         existing = set()
-        cursor.execute('SELECT word, translation FROM words')
-        for row in cursor.fetchall():
-            existing.add((row[0], row[2]))
+        
+        # Безопасное чтение существующих слов
+        try:
+            cursor.execute('SELECT word, translation FROM words')
+            rows = cursor.fetchall()
+            for row in rows:
+                if row and len(row) >= 2:
+                    word_val = row[0] if row[0] else ""
+                    trans_val = row[1] if row[1] else ""
+                    existing.add((word_val, trans_val))
+        except Exception as e:
+            print(f"⚠️ Пропуск проверки дубликатов: {e}")
 
         new_words = [w for w in WORDS_DATABASE if (w[0], w[2]) not in existing]
         if new_words:
@@ -1054,12 +1069,9 @@ def setup_scheduler(app):
     return scheduler
 
 
-# ============================================================
-# СИСТЕМА АВТОМАТИЧЕСКОГО ПЕРЕПОДКЛЮЧЕНИЯ
-# ============================================================
+# ===== СИСТЕМА АВТОМАТИЧЕСКОГО ПЕРЕПОДКЛЮЧЕНИЯ =====
 
 async def check_connection(bot):
-    """Проверяет наличие подключения к Telegram"""
     try:
         await bot.get_me()
         return True
@@ -1070,7 +1082,6 @@ async def check_connection(bot):
 
 
 async def reconnect_bot(app):
-    """Переподключает бота к Telegram"""
     global reconnect_attempt, is_running
 
     while is_running:
@@ -1084,12 +1095,11 @@ async def reconnect_bot(app):
                 print(f"❌ Превышено максимальное количество попыток ({MAX_RECONNECT_ATTEMPTS})")
                 return False
 
-            delay = min(BASE_RECONNECT_DELAY * reconnect_attempt, 300)  # Максимум 5 минут
+            delay = min(BASE_RECONNECT_DELAY * reconnect_attempt, 300)
             print(f"🔌 Потеря связи. Попытка переподключения {reconnect_attempt}/{MAX_RECONNECT_ATTEMPTS} через {delay}с...")
 
             await asyncio.sleep(delay)
 
-            # Пробуем переинициализировать бота
             try:
                 await app.updater.stop()
                 await app.stop()
@@ -1109,7 +1119,6 @@ async def reconnect_bot(app):
 
 
 async def connection_watchdog(app):
-    """Следит за состоянием подключения и переподключает при необходимости"""
     global is_running
 
     print("🔄 Система автоматического переподключения активирована")
@@ -1137,7 +1146,7 @@ async def connection_watchdog(app):
         except Exception as error:
             print(f"❌ Ошибка в системе мониторинга: {error}")
 
-        await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+        await asyncio.sleep(30)
 
 
 # ===== ОБРАБОТКА ОШИБОК =====
@@ -1172,7 +1181,6 @@ async def main():
     init_db()
     os.makedirs(TEMP_DIR, exist_ok=True)
 
-    # Пробуем подключиться с повторными попытками
     print("🔌 Подключение к Telegram...")
     max_attempts = 10
     for attempt in range(max_attempts):
@@ -1187,7 +1195,6 @@ async def main():
 
             application.add_error_handler(error_handler)
 
-            # Команды
             application.add_handler(CommandHandler("start", start))
             application.add_handler(CommandHandler("help", help_command))
             application.add_handler(CommandHandler("words", show_learned_words))
@@ -1217,7 +1224,6 @@ async def main():
             else:
                 print("❌ Не удалось подключиться")
                 print("💡 Бот продолжит попытки подключения в фоновом режиме")
-                # Создаем минимальное приложение для фоновых попыток
                 application = Application.builder().token(BOT_TOKEN).build()
                 break
         except Exception as error:
@@ -1233,10 +1239,8 @@ async def main():
     await asyncio.sleep(2)
     await update_bot_bio(application)
 
-    # Запускаем систему мониторинга подключения
     watchdog_task = asyncio.create_task(connection_watchdog(application))
 
-    # Основной цикл
     while is_running:
         await asyncio.sleep(1)
 
