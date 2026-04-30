@@ -152,7 +152,7 @@ def get_word_audio(word):
         return None
 
 
-# ===== БАЗА ДАННЫХ (ИСПРАВЛЕНО) =====
+# ===== БАЗА ДАННЫХ =====
 
 def init_db():
     connection = sqlite3.connect('english_words.db')
@@ -214,7 +214,6 @@ def init_db():
 
     connection.commit()
 
-    # Добавляем колонки если их нет
     for col in ['first_name', 'last_name', 'total_checks', 'total_learned']:
         try:
             if col in ['first_name', 'last_name']:
@@ -225,7 +224,7 @@ def init_db():
             pass
     connection.commit()
 
-    # ИСПРАВЛЕНИЕ: Чиним битые записи в базе
+    # Чиним битые записи
     try:
         cursor.execute("UPDATE words SET translation = 'перевод' WHERE translation IS NULL OR translation = ''")
         cursor.execute("UPDATE words SET word = 'unknown' WHERE word IS NULL OR word = ''")
@@ -240,7 +239,6 @@ def init_db():
         print(f"📚 Загрузка слов... (текущее: {count})")
         existing = set()
         
-        # Безопасное чтение существующих слов
         try:
             cursor.execute('SELECT word, translation FROM words')
             rows = cursor.fetchall()
@@ -569,7 +567,6 @@ async def update_bot_bio(context):
         bot = context.bot if hasattr(context, 'bot') else context.application.bot
         count = get_subscriber_count()
         description = f"👥 {count} учеников"
-
         try:
             await bot.set_my_description(description)
         except Exception:
@@ -781,13 +778,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def format_user_info(user):
-    user_id, username, first_name, last_name, subscribed, first_seen, last_active, total_checks, total_learned = user[:9]
+    uid, username, first_name, last_name, subscribed, first_seen, last_active, total_checks, total_learned = user[:9]
     name = " ".join([n for n in [first_name, last_name] if n]) or "Не указано"
     status = "🟢" if subscribed else "🔴"
     username_str = f"@{username}" if username else "нет username"
     return (
         f"{status} <b>{name}</b>\n"
-        f"   ID: <code>{user_id}</code>\n"
+        f"   ID: <code>{uid}</code>\n"
         f"   Username: {username_str}\n"
         f"   Вход: {first_seen[:10] if first_seen else 'Н/Д'}\n"
         f"   Активность: {last_active[:10] if last_active else 'Н/Д'}\n"
@@ -1109,7 +1106,7 @@ async def reconnect_bot(app):
             try:
                 await app.initialize()
                 await app.start()
-                await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
             except Exception as error:
                 print(f"⚠️ Ошибка переподключения: {error}")
 
@@ -1137,12 +1134,6 @@ async def connection_watchdog(app):
                     print("❌ Не удалось восстановить соединение")
                     is_running = False
                     break
-            else:
-                global reconnect_attempt
-                if reconnect_attempt > 0:
-                    reconnect_attempt = 0
-                    print("🟢 Соединение стабильно")
-
         except Exception as error:
             print(f"❌ Ошибка в системе мониторинга: {error}")
 
@@ -1173,8 +1164,9 @@ def signal_handler(signum, _frame):
 async def main():
     global application, word_scheduler, bio_scheduler, is_running
 
+    # Игнорируем SIGTERM от хостинга (чтобы бот не выключался)
+    signal.signal(signal.SIGTERM, lambda signum, frame: print("⚠️ Получен SIGTERM от хостинга, игнорирую..."))
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
     is_running = True
 
     print("🗄 Инициализация базы...")
@@ -1210,7 +1202,18 @@ async def main():
 
             await application.initialize()
             await application.start()
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            
+            try:
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True
+                )
+            except Exception as e:
+                if "Conflict" in str(e):
+                    print("❌ Бот уже запущен. Остановите другой экземпляр!")
+                    await application.stop()
+                    return
+                raise
 
             print("✅ Подключено!")
             break
@@ -1223,9 +1226,7 @@ async def main():
                 await asyncio.sleep(wait)
             else:
                 print("❌ Не удалось подключиться")
-                print("💡 Бот продолжит попытки подключения в фоновом режиме")
-                application = Application.builder().token(BOT_TOKEN).build()
-                break
+                return
         except Exception as error:
             print(f"❌ Ошибка: {error}")
             return
