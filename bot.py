@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import asyncio
-import signal
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -21,13 +20,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # Глобальные переменные
 check_sessions = {}
-application = None
 word_scheduler = None
 bio_scheduler = None
-is_running = True
-reconnect_attempt = 0
-MAX_RECONNECT_ATTEMPTS = 100
-BASE_RECONNECT_DELAY = 5
 
 TEMP_DIR = "temp_audio"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -98,44 +92,28 @@ def get_users_navigation_keyboard(page, total_pages, prefix):
 
 # ===== БЕЗОПАСНАЯ ОТПРАВКА =====
 
-async def safe_send_message(bot, chat_id, text, parse_mode='HTML', reply_markup=None, max_retries=5):
+async def safe_send_message(bot, chat_id, text, parse_mode='HTML', reply_markup=None, max_retries=3):
     for attempt in range(max_retries):
         try:
             return await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
-            )
-        except (TimedOut, NetworkError):
-            if attempt < max_retries - 1:
-                delay = 2 * (attempt + 1)
-                print(f"⚠️ Таймаут отправки. Повтор через {delay}с...")
-                await asyncio.sleep(delay)
-        except RetryAfter as error:
-            delay = min(error.retry_after, 30)
-            print(f"⏳ Ожидание {delay}с...")
-            await asyncio.sleep(delay)
-        except Exception as error:
-            print(f"❌ Ошибка отправки: {error}")
-            break
-    return None
-
-
-async def safe_edit_message(message, text, parse_mode='HTML', reply_markup=None, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            return await message.edit_text(
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
+                chat_id=chat_id, text=text,
+                parse_mode=parse_mode, reply_markup=reply_markup
             )
         except (TimedOut, NetworkError):
             if attempt < max_retries - 1:
                 await asyncio.sleep(2)
+        except RetryAfter as error:
+            await asyncio.sleep(min(error.retry_after, 10))
         except Exception:
             break
     return None
+
+
+async def safe_edit_message(message, text, parse_mode='HTML', reply_markup=None):
+    try:
+        return await message.edit_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception:
+        return None
 
 
 # ===== АУДИО =====
@@ -224,31 +202,19 @@ def init_db():
             pass
     connection.commit()
 
-    # Чиним битые записи
-    try:
-        cursor.execute("UPDATE words SET translation = 'перевод' WHERE translation IS NULL OR translation = ''")
-        cursor.execute("UPDATE words SET word = 'unknown' WHERE word IS NULL OR word = ''")
-        connection.commit()
-    except sqlite3.OperationalError:
-        pass
-
     cursor.execute('SELECT COUNT(*) FROM words')
     count = cursor.fetchone()[0]
 
     if count < len(WORDS_DATABASE):
         print(f"📚 Загрузка слов... (текущее: {count})")
         existing = set()
-        
         try:
             cursor.execute('SELECT word, translation FROM words')
-            rows = cursor.fetchall()
-            for row in rows:
+            for row in cursor.fetchall():
                 if row and len(row) >= 2:
-                    word_val = row[0] if row[0] else ""
-                    trans_val = row[1] if row[1] else ""
-                    existing.add((word_val, trans_val))
-        except Exception as e:
-            print(f"⚠️ Пропуск проверки дубликатов: {e}")
+                    existing.add((row[0] or "", row[1] or ""))
+        except Exception:
+            pass
 
         new_words = [w for w in WORDS_DATABASE if (w[0], w[2]) not in existing]
         if new_words:
@@ -413,10 +379,7 @@ def add_mistake(user_id, word_id):
                 'INSERT INTO mistakes (user_id, word_id, mistake_date) VALUES (?, ?, ?)',
                 (user_id, word_id, today)
             )
-        connection.execute(
-            'UPDATE users SET total_checks = total_checks + 1 WHERE user_id = ?',
-            (user_id,)
-        )
+        connection.execute('UPDATE users SET total_checks = total_checks + 1 WHERE user_id = ?', (user_id,))
         connection.commit()
         connection.close()
 
@@ -566,11 +529,7 @@ async def update_bot_bio(context):
     try:
         bot = context.bot if hasattr(context, 'bot') else context.application.bot
         count = get_subscriber_count()
-        description = f"👥 {count} учеников"
-        try:
-            await bot.set_my_description(description)
-        except Exception:
-            pass
+        await bot.set_my_description(f"👥 {count} учеников")
     except Exception:
         pass
 
@@ -636,8 +595,7 @@ async def send_words_to_user(context, user_id):
                         await context.bot.send_audio(
                             user_id, file,
                             caption=f"🔊 <b>{w[1]}</b> - {w[3]}",
-                            parse_mode='HTML',
-                            title=w[1]
+                            parse_mode='HTML', title=w[1]
                         )
                     except Exception:
                         pass
@@ -650,12 +608,7 @@ async def send_words_to_user(context, user_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    add_user(
-        user_id,
-        update.effective_user.username,
-        update.effective_user.first_name,
-        update.effective_user.last_name
-    )
+    add_user(user_id, update.effective_user.username, update.effective_user.first_name, update.effective_user.last_name)
     await notify_admin_new_subscriber(context, user_id, update.effective_user.username)
 
     keyboard = get_admin_keyboard() if is_admin(user_id) else get_main_keyboard()
@@ -699,24 +652,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bar = '🟢' * int(percentage // 10) + '⚪' * (10 - int(percentage // 10))
         await safe_edit_message(
             query.message,
-            f"📊 <b>Статистика</b>\n\n"
-            f"📚 Всего: <b>{total}</b>\n"
+            f"📊 <b>Статистика</b>\n\n📚 Всего: <b>{total}</b>\n"
             f"✅ Выучено: <b>{learned}</b> ({percentage:.1f}%)\n"
-            f"❌ На повторении: <b>{mistakes}</b>\n"
-            f"📈 {bar}",
+            f"❌ На повторении: <b>{mistakes}</b>\n📈 {bar}",
             reply_markup=get_back_keyboard()
         )
     elif data == "listen_word":
-        await safe_edit_message(
-            query.message,
-            "🔊 Используйте: <code>/listen apple</code>",
-            reply_markup=get_back_keyboard()
-        )
+        await safe_edit_message(query.message, "🔊 Используйте: <code>/listen apple</code>", reply_markup=get_back_keyboard())
     elif data == "help":
         await safe_edit_message(
             query.message,
-            "📖 <b>Бот:</b>\n9:10 - слова\n20:00 - проверка\n"
-            "Ошибки повторяются\n\n💡 Отвечайте в нижнем регистре",
+            "📖 <b>Бот:</b>\n9:10 - слова\n20:00 - проверка\nОшибки повторяются\n\n💡 Отвечайте в нижнем регистре",
             reply_markup=get_back_keyboard()
         )
     elif data == "subscribe":
@@ -740,8 +686,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await safe_edit_message(
                 query.message,
-                f"📊 <b>Статистика</b>\n\n"
-                f"👥 Всего: <b>{get_total_users()}</b>\n"
+                f"📊 <b>Статистика</b>\n\n👥 Всего: <b>{get_total_users()}</b>\n"
                 f"✅ Подписчики: <b>{get_subscriber_count()}</b>\n"
                 f"📅 Сегодня: <b>{get_active_users_today()}</b>\n"
                 f"📚 Слов: <b>{get_word_count()}</b>",
@@ -758,8 +703,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👥 Всего: <b>{get_total_users()}</b>\n"
                 f"✅ Подписчики: <b>{get_subscriber_count()}</b>\n"
                 f"📅 Сегодня: <b>{get_active_users_today()}</b>\n"
-                f"📚 Слов: <b>{get_word_count()}</b>\n\n"
-                f"<b>🏆 Топ-10:</b>\n"
+                f"📚 Слов: <b>{get_word_count()}</b>\n\n<b>🏆 Топ-10:</b>\n"
             )
             for i, u in enumerate(top, 1):
                 msg += f"{i}. @{u[1] or f'user{u[0]}'}: <b>{u[2]}</b> слов\n"
@@ -783,10 +727,8 @@ def format_user_info(user):
     status = "🟢" if subscribed else "🔴"
     username_str = f"@{username}" if username else "нет username"
     return (
-        f"{status} <b>{name}</b>\n"
-        f"   ID: <code>{uid}</code>\n"
-        f"   Username: {username_str}\n"
-        f"   Вход: {first_seen[:10] if first_seen else 'Н/Д'}\n"
+        f"{status} <b>{name}</b>\n   ID: <code>{uid}</code>\n"
+        f"   Username: {username_str}\n   Вход: {first_seen[:10] if first_seen else 'Н/Д'}\n"
         f"   Активность: {last_active[:10] if last_active else 'Н/Д'}\n"
         f"   Проверок: {total_checks or 0} | Выучено: {total_learned or 0}"
     )
@@ -804,10 +746,7 @@ async def show_all_users_page(query, user_id, page=1):
     msg = f"<b>👥 Все пользователи</b>\n📊 Всего: <b>{total}</b> | {page}/{total_pages}\n\n"
     for u in users:
         msg += format_user_info(u) + "\n"
-    await safe_edit_message(
-        query.message, msg,
-        reply_markup=get_users_navigation_keyboard(page, total_pages, "all_users")
-    )
+    await safe_edit_message(query.message, msg, reply_markup=get_users_navigation_keyboard(page, total_pages, "all_users"))
 
 
 async def show_active_users_page(query, user_id, page=1):
@@ -826,27 +765,18 @@ async def show_active_users_page(query, user_id, page=1):
         status = "🟢" if sub else "🔴"
         uname_str = f"@{uname}" if uname else "нет username"
         msg += (
-            f"{status} <b>{name}</b>\n"
-            f"   ID: <code>{uid_val}</code>\n"
-            f"   Username: {uname_str}\n"
-            f"   Слов сегодня: {w_today or 0}\n"
+            f"{status} <b>{name}</b>\n   ID: <code>{uid_val}</code>\n"
+            f"   Username: {uname_str}\n   Слов сегодня: {w_today or 0}\n"
             f"   Проверок: {t_checks or 0} | Выучено: {t_learned or 0}\n\n"
         )
-    await safe_edit_message(
-        query.message, msg,
-        reply_markup=get_users_navigation_keyboard(page, total_pages, "active_users")
-    )
+    await safe_edit_message(query.message, msg, reply_markup=get_users_navigation_keyboard(page, total_pages, "active_users"))
 
 
 # ===== КОМАНДЫ =====
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = get_admin_keyboard() if is_admin(update.effective_user.id) else get_main_keyboard()
-    await safe_send_message(
-        context.bot, update.effective_chat.id,
-        "📖 Используйте кнопки или команды:\n/words, /stats, /listen",
-        reply_markup=keyboard
-    )
+    await safe_send_message(context.bot, update.effective_chat.id, "📖 Используйте кнопки или команды:\n/words, /stats, /listen", reply_markup=keyboard)
 
 
 async def listen_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -857,17 +787,9 @@ async def listen_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audio = get_word_audio(word)
     if audio and os.path.exists(audio):
         with open(audio, 'rb') as file:
-            await context.bot.send_audio(
-                update.effective_chat.id, file,
-                caption=f"🔊 <b>{word}</b>",
-                parse_mode='HTML',
-                title=word
-            )
+            await context.bot.send_audio(update.effective_chat.id, file, caption=f"🔊 <b>{word}</b>", parse_mode='HTML', title=word)
     else:
-        await safe_send_message(
-            context.bot, update.effective_chat.id,
-            f"❌ Не удалось создать аудио для <b>{word}</b>"
-        )
+        await safe_send_message(context.bot, update.effective_chat.id, f"❌ Не удалось создать аудио для <b>{word}</b>")
 
 
 async def show_learned_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -888,11 +810,9 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bar = '🟢' * int(percentage // 10) + '⚪' * (10 - int(percentage // 10))
     await safe_send_message(
         context.bot, update.effective_chat.id,
-        f"📊 <b>Статистика</b>\n\n"
-        f"📚 Всего: <b>{total}</b>\n"
+        f"📊 <b>Статистика</b>\n\n📚 Всего: <b>{total}</b>\n"
         f"✅ Выучено: <b>{learned}</b> ({percentage:.1f}%)\n"
-        f"❌ На повторении: <b>{mistakes}</b>\n"
-        f"📈 {bar}"
+        f"❌ На повторении: <b>{mistakes}</b>\n📈 {bar}"
     )
 
 
@@ -940,10 +860,8 @@ async def start_check_for_user(context, user_id):
     check_sessions[user_id] = {'words': words, 'current_index': 0, 'answers': {}}
     await safe_send_message(
         context.bot, user_id,
-        f"📝 <b>Проверка!</b>\n\n"
-        f"Напишите перевод:\n\n"
-        f"<b>{words[0][1]}</b> [{words[0][2]}]\n\n"
-        f"Слово 1 из {len(words)}"
+        f"📝 <b>Проверка!</b>\n\nНапишите перевод:\n\n"
+        f"<b>{words[0][1]}</b> [{words[0][2]}]\n\nСлово 1 из {len(words)}"
     )
 
 
@@ -960,28 +878,21 @@ async def process_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     word = words[idx]
     correct = word[3].lower() == answer
     session['answers'][word[0]] = {
-        'word': word[1],
-        'transcription': word[2],
-        'correct_translation': word[3],
-        'user_answer': answer,
-        'is_correct': correct
+        'word': word[1], 'transcription': word[2],
+        'correct_translation': word[3], 'user_answer': answer, 'is_correct': correct
     }
 
     if correct:
         await safe_send_message(context.bot, update.effective_chat.id, "✅ Правильно!")
     else:
-        await safe_send_message(
-            context.bot, update.effective_chat.id,
-            f"❌ Неправильно!\nПравильно: <b>{word[3]}</b>"
-        )
+        await safe_send_message(context.bot, update.effective_chat.id, f"❌ Неправильно!\nПравильно: <b>{word[3]}</b>")
 
     session['current_index'] += 1
     if session['current_index'] < len(words):
         next_word = words[session['current_index']]
         await safe_send_message(
             context.bot, update.effective_chat.id,
-            f"Слово {session['current_index'] + 1} из {len(words)}:\n\n"
-            f"<b>{next_word[1]}</b> [{next_word[2]}]"
+            f"Слово {session['current_index'] + 1} из {len(words)}:\n\n<b>{next_word[1]}</b> [{next_word[2]}]"
         )
     else:
         await finish_check(update, context, user_id)
@@ -1015,8 +926,7 @@ async def finish_check(update, context, user_id):
     msg = (
         f"{emoji} <b>Результаты</b>\n\n"
         f"✅ Правильно: <b>{correct_count}</b> из <b>{total}</b>\n"
-        f"📊 {percentage:.0f}%\n\n"
-        f"<i>{comment}</i>\n\n"
+        f"📊 {percentage:.0f}%\n\n<i>{comment}</i>\n\n"
     )
 
     incorrect = {k: v for k, v in answers.items() if not v['is_correct']}
@@ -1066,80 +976,6 @@ def setup_scheduler(app):
     return scheduler
 
 
-# ===== СИСТЕМА АВТОМАТИЧЕСКОГО ПЕРЕПОДКЛЮЧЕНИЯ =====
-
-async def check_connection(bot):
-    try:
-        await bot.get_me()
-        return True
-    except (TimedOut, NetworkError):
-        return False
-    except Exception:
-        return False
-
-
-async def reconnect_bot(app):
-    global reconnect_attempt, is_running
-
-    while is_running:
-        try:
-            if await check_connection(app.bot):
-                reconnect_attempt = 0
-                return True
-
-            reconnect_attempt += 1
-            if reconnect_attempt > MAX_RECONNECT_ATTEMPTS:
-                print(f"❌ Превышено максимальное количество попыток ({MAX_RECONNECT_ATTEMPTS})")
-                return False
-
-            delay = min(BASE_RECONNECT_DELAY * reconnect_attempt, 300)
-            print(f"🔌 Потеря связи. Попытка переподключения {reconnect_attempt}/{MAX_RECONNECT_ATTEMPTS} через {delay}с...")
-
-            await asyncio.sleep(delay)
-
-            try:
-                await app.updater.stop()
-                await app.stop()
-            except Exception:
-                pass
-
-            try:
-                await app.initialize()
-                await app.start()
-                await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-            except Exception as error:
-                print(f"⚠️ Ошибка переподключения: {error}")
-
-        except Exception as error:
-            print(f"❌ Критическая ошибка: {error}")
-            await asyncio.sleep(10)
-
-
-async def connection_watchdog(app):
-    global is_running
-
-    print("🔄 Система автоматического переподключения активирована")
-
-    while is_running:
-        try:
-            connected = await check_connection(app.bot)
-
-            if not connected:
-                print("🔴 Соединение потеряно. Запуск переподключения...")
-                success = await reconnect_bot(app)
-
-                if success:
-                    print("🟢 Соединение восстановлено!")
-                else:
-                    print("❌ Не удалось восстановить соединение")
-                    is_running = False
-                    break
-        except Exception as error:
-            print(f"❌ Ошибка в системе мониторинга: {error}")
-
-        await asyncio.sleep(30)
-
-
 # ===== ОБРАБОТКА ОШИБОК =====
 
 async def error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1153,114 +989,68 @@ async def error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
 
 
-def signal_handler(signum, _frame):
-    global is_running
-    print(f"\n📡 Получен сигнал {signum}. Завершение работы...")
-    is_running = False
-
-
 # ===== MAIN =====
 
 async def main():
-    global application, word_scheduler, bio_scheduler, is_running
-
-    # Игнорируем SIGTERM от хостинга (чтобы бот не выключался)
-    signal.signal(signal.SIGTERM, lambda signum, frame: print("⚠️ Получен SIGTERM от хостинга, игнорирую..."))
-    signal.signal(signal.SIGINT, signal_handler)
-    is_running = True
+    global word_scheduler, bio_scheduler
 
     print("🗄 Инициализация базы...")
     init_db()
     os.makedirs(TEMP_DIR, exist_ok=True)
 
     print("🔌 Подключение к Telegram...")
-    max_attempts = 10
-    for attempt in range(max_attempts):
-        try:
-            print(f"   Попытка {attempt + 1}/{max_attempts}...")
 
-            application = Application.builder().token(BOT_TOKEN) \
-                .connect_timeout(60) \
-                .read_timeout(60) \
-                .pool_timeout(120) \
-                .build()
+    application = Application.builder().token(BOT_TOKEN) \
+        .connect_timeout(60) \
+        .read_timeout(60) \
+        .pool_timeout(120) \
+        .build()
 
-            application.add_error_handler(error_handler)
+    application.add_error_handler(error_handler)
 
-            application.add_handler(CommandHandler("start", start))
-            application.add_handler(CommandHandler("help", help_command))
-            application.add_handler(CommandHandler("words", show_learned_words))
-            application.add_handler(CommandHandler("stats", show_stats))
-            application.add_handler(CommandHandler("listen", listen_word))
-            application.add_handler(CommandHandler("subscribe", subscribe_command))
-            application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-            application.add_handler(CommandHandler("users", users_command))
-            application.add_handler(CallbackQueryHandler(button_handler))
-            application.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_answer)
-            )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("words", show_learned_words))
+    application.add_handler(CommandHandler("stats", show_stats))
+    application.add_handler(CommandHandler("listen", listen_word))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_answer))
 
-            await application.initialize()
-            await application.start()
-            
-            try:
-                await application.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
-                )
-            except Exception as e:
-                if "Conflict" in str(e):
-                    print("❌ Бот уже запущен. Остановите другой экземпляр!")
-                    await application.stop()
-                    return
-                raise
-
-            print("✅ Подключено!")
-            break
-
-        except (TimedOut, NetworkError):
-            print(f"⚠️ Таймаут (попытка {attempt + 1})")
-            if attempt < max_attempts - 1:
-                wait = (attempt + 1) * 5
-                print(f"⏳ Ожидание {wait}с...")
-                await asyncio.sleep(wait)
-            else:
-                print("❌ Не удалось подключиться")
-                return
-        except Exception as error:
-            print(f"❌ Ошибка: {error}")
+    await application.initialize()
+    await application.start()
+    
+    try:
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Exception as e:
+        if "Conflict" in str(e):
+            print("❌ Бот уже запущен. Остановите другой экземпляр!")
+            await application.stop()
             return
+        raise
+
+    print("✅ Подключено!")
 
     word_scheduler = setup_scheduler(application)
     bio_scheduler = setup_bio_update_scheduler(application)
 
     print("✅ Бот запущен!")
-    print("🔄 Система автопереподключения активирована")
 
     await asyncio.sleep(2)
     await update_bot_bio(application)
 
-    watchdog_task = asyncio.create_task(connection_watchdog(application))
-
-    while is_running:
+    # Держим бота запущенным
+    while True:
         await asyncio.sleep(1)
-
-    print("🛑 Завершение работы...")
-    watchdog_task.cancel()
-    try:
-        await application.updater.stop()
-        await application.stop()
-    except Exception:
-        pass
-    if word_scheduler:
-        word_scheduler.shutdown()
-    if bio_scheduler:
-        bio_scheduler.shutdown()
-    print("👋 Бот остановлен")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен пользователем")
+        print("\n👋 Бот остановлен")
